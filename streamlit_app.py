@@ -1,128 +1,122 @@
 # rename_postnummer_app.py
 import streamlit as st
 from pathlib import Path
-import re
 import pandas as pd
 import os
+import io
+import zipfile
+from typing import List, Optional
 
-st.set_page_config(page_title="Rename PDF til postnummer", layout="wide")
+st.set_page_config(page_title="Rename PDF — lokal eller drag & drop", layout="wide")
+st.title("Bulk rename — PDF → del før/etter skilletegn (lokal eller drag&drop)")
+st.markdown("""
+- Du kan peke på en **lokal mappe** (app kjører lokalt) for å **endre filer på disk** (krever backup).
+- Eller **dra & slipp** PDF-filer i feltet under — appen lager da en **ZIP** med de omdøpte filene (originalene påvirkes ikke).
+- Standard: **Tørrkjøring = False** (dvs. ved lokal rename vil endringer skje når du bekrefter backup).
+""")
 
-st.title("Bulk rename — PDF → postnummer")
-st.markdown(
-    """
-App for å gi PDF-filer nye navn basert på delen før første `_` i filnavnet,
-ekstrahere siffer (fjerne punktum/andre tegn) og håndtere duplikater.
-**Viktig:** ta backup av mappen før du kjører endelig rename.
-"""
-)
+with st.expander("Hvordan det fungerer (kort)"):
+    st.write("""
+    - Velg skilletegn (standard `_`) og om du vil bruke delen **før** eller **etter** skilletegnet.
+    - Appen beholder punktum i resultatet som standard.
+    - For lokale filer: må bekrefte at du har tatt backup før rename tillates.
+    - For opplastede filer: du får nedlastbar ZIP med omdøpte kopier.
+    """)
 
-with st.expander("Hvordan dette fungerer (kort)"):
-    st.write(
-        """
-        - Henter alle `*.pdf` i valgt mappe.
-        - Deler filnavnet ved første `_` og tar den delen.
-        - Fjerner alle ikke-siffer (så `44.14.1_20251112.pdf` → `44141.pdf`).
-        - Hvis ønsket, forkorter til første N sifre (f.eks. 4 for norsk postnummer).
-        - Viser en forhåndsvisning (dry run). Når du er fornøyd: huk av bekreftelse og trykk **Rename**.
-        - Ved duplikat legges `_1`, `_2`, ... til.
-        """
-    )
-
-# --- Brukerinnstillinger ---
+# --- Innstillinger ---
 col1, col2 = st.columns([2, 1])
 with col1:
-    folder = st.text_input("Mappe (full sti) med PDF-filer", value=".")
-    load_btn = st.button("Last inn filer")
+    folder = st.text_input("Mappe (full sti) med PDF-filer (la stå tom for kun upload)", value="")
+    load_btn = st.button("Last inn lokale filer (henter *.pdf fra denne mappen)")
 with col2:
-    dry_run_default = True
-    dry_run = st.checkbox("Tørrkjøring (dry run)", value=dry_run_default)
-    first_n = st.number_input("Behold kun første N sifre (0 = alle)", min_value=0, value=0, step=1)
-    confirm_backup = st.checkbox("Jeg har tatt backup av mappen (kreves for rename)", value=False)
+    # default dry_run = False etter ønske
+    dry_run = st.checkbox("Tørrkjøring (dry run) — Lokal rename (hvis avkrysset: gjør ikke endringer)", value=False)
+    sep = st.text_input("Skilletegn (separator)", value="_", max_chars=3)
+    split_side = st.radio("Velg hvilken del som skal brukes:", ("før", "etter"))
+    first_n = st.number_input("Behold kun første N tegn (0 = alle)", min_value=0, value=0, step=1)
+    keep_dots = st.checkbox("Behold punktum (.) i resultatet", value=True)
+    confirm_backup = st.checkbox("Jeg har tatt backup av mappen (kreves for lokal rename)", value=False)
 
 st.markdown("---")
 
-def compute_new_name(fname: str, keep_ext: str = ".pdf", first_n_digits: int = 0):
-    # Ta delen før første underscore
-    base = Path(fname).stem
-    prefix = base.split("_", 1)[0]
-    # Fjern alt som ikke er siffer
-    digits = re.sub(r"\D", "", prefix)
-    if first_n_digits and digits:
-        digits = digits[:first_n_digits]
-    if not digits:
-        return None  # signal om at vi ikke fant et nytt navn
-    return f"{digits}{keep_ext}"
+def compute_new_name(fname: str, separator: str, side: str, keep_dots_flag: bool, first_n_chars: int = 0) -> Optional[str]:
+    p = Path(fname)
+    base = p.stem  # uten .pdf
+    if separator and separator in base:
+        if side == "før":
+            part = base.split(separator, 1)[0]
+        else:
+            part = base.split(separator, 1)[1]
+    else:
+        part = base
+    part = part.strip()
+    if not keep_dots_flag:
+        part = part.replace(".", "")
+    if first_n_chars and first_n_chars > 0:
+        part = part[:first_n_chars]
+    if part == "":
+        return None
+    return f"{part}{p.suffix}"
 
-def preview_renames(target_dir: Path, first_n_digits: int = 0):
-    rows = []
-    for p in sorted(target_dir.glob("*.pdf")):
-        old = p.name
-        new = compute_new_name(old, first_n_digits=first_n_digits)
-        rows.append({"old_name": old, "new_name": new or "(ingen siffer funnet)", "path": str(p)})
-    return pd.DataFrame(rows)
+def simulate_unique_names(proposed: List[str]) -> List[str]:
+    """Gjør navn unike ved å legge _1, _2 ... ved behov"""
+    taken = set()
+    final = []
+    for name in proposed:
+        if name is None:
+            final.append(None)
+            continue
+        candidate = name
+        if candidate in taken:
+            i = 1
+            base = Path(name).stem
+            ext = Path(name).suffix or ".pdf"
+            while True:
+                candidate = f"{base}_{i}{ext}"
+                if candidate not in taken:
+                    break
+                i += 1
+        taken.add(candidate)
+        final.append(candidate)
+    return final
 
-# --- Last inn filer og vis forhåndsvisning ---
-if load_btn:
+# --- Håndter lokal mappe preview/rename ---
+local_df = None
+if load_btn and folder:
     target = Path(folder).expanduser().resolve()
     if not target.exists() or not target.is_dir():
         st.error("Fant ikke mappen — sjekk stien og prøv igjen.")
     else:
-        df_preview = preview_renames(target, first_n_digits=first_n)
-        # Simulér duplikater i preview (hvilket navn det ville blitt)
-        def simulate_unique_names(df):
-            taken = set()
-            results = []
-            for _, r in df.iterrows():
-                new = r["new_name"]
-                if new is None or new.startswith("("):
-                    results.append({"old": r["old_name"], "new": r["new_name"], "final_new": None})
-                    continue
-                candidate = new
-                if candidate in taken:
-                    i = 1
-                    base = Path(new).stem
-                    ext = Path(new).suffix or ".pdf"
-                    while True:
-                        candidate = f"{base}_{i}{ext}"
-                        if candidate not in taken:
-                            break
-                        i += 1
-                taken.add(candidate)
-                results.append({"old": r["old_name"], "new": r["new_name"], "final_new": candidate})
-            return pd.DataFrame(results)
-        df_sim = simulate_unique_names(df_preview)
-        st.subheader(f"Forhåndsvisning — filer i {target}")
-        st.dataframe(df_sim[["old", "final_new"]].rename(columns={"old":"Gammelt navn","final_new":"Nytt navn (preview)"}), height=400)
+        rows = []
+        for p in sorted(target.glob("*.pdf")):
+            old = p.name
+            new = compute_new_name(old, sep, split_side, keep_dots, first_n)
+            rows.append({"old_name": old, "proposed": new})
+        df = pd.DataFrame(rows)
+        df["final_new"] = simulate_unique_names(list(df["proposed"]))
+        local_df = df
+        st.subheader(f"Lokal forhåndsvisning — filer i {target}")
+        st.dataframe(df.rename(columns={"old_name":"Gammelt navn","final_new":"Nytt navn (preview)"}), height=400)
+        st.info(f"Filer funnet: {len(df)} — Hoppet over: {df['final_new'].isna().sum()}")
 
-        # Vis noen statistikker
-        total = len(df_sim)
-        skipped = df_sim['final_new'].isna().sum()
-        st.info(f"Filer funnet: {total} — Filer som ville blitt hoppet over (ingen siffer): {skipped}")
-
-        # Knapper for å utføre rename
-        col_a, col_b = st.columns(2)
-        with col_a:
-            do_rename = st.button("Rename filer nå", disabled=not confirm_backup)
-        with col_b:
-            st.write("⚠️ Krever at du har haket av at du har backup før rename aktiveres.")
-
-        # Utfør rename hvis ønsket
-        if do_rename:
+        # Rename-knapp for lokal mappe
+        do_local_rename = st.button("Utfør lokal rename (endre filene på disk)", disabled=not confirm_backup)
+        if do_local_rename:
             if not confirm_backup:
                 st.error("Du må bekrefte at du har tatt backup før rename kan kjøres.")
             else:
                 renamed = []
-                skipped_list = []
+                skipped = []
                 errors = []
-                for _, r in df_sim.iterrows():
-                    old_name = r["old"]
+                for _, r in df.iterrows():
+                    old = r["old_name"]
                     final_new = r["final_new"]
-                    p = target / old_name
+                    src = target / old
                     if final_new is None:
-                        skipped_list.append(old_name)
+                        skipped.append(old)
                         continue
                     dest = target / final_new
-                    # Hvis destination allerede finnes (ekstern), finn nytt unikt navn
+                    # finn unikt navn om dest finnes allerede
                     i = 1
                     base = Path(final_new).stem
                     ext = Path(final_new).suffix or ".pdf"
@@ -130,20 +124,68 @@ if load_btn:
                         dest = target / f"{base}_{i}{ext}"
                         i += 1
                     try:
-                        os.rename(p, dest)
-                        renamed.append((old_name, dest.name))
+                        if dry_run:
+                            renamed.append((old, dest.name))
+                        else:
+                            os.rename(src, dest)
+                            renamed.append((old, dest.name))
                     except Exception as e:
-                        errors.append((old_name, str(e)))
-                st.success(f"Ferdig. Renamet: {len(renamed)} filer. Hoppet over: {len(skipped_list)}. Feil: {len(errors)}.")
+                        errors.append((old, str(e)))
+                st.success(f"(local rename) Ferdig. (dry_run={dry_run}) Renamet: {len(renamed)}. Hoppet over: {len(skipped)}. Feil: {len(errors)}")
                 if renamed:
-                    st.write("Eksempel (før -> etter):")
-                    st.table(pd.DataFrame(renamed, columns=["gammelt","nytt"]).head(20))
-                if skipped_list:
-                    st.warning("Hoppet over (ingen siffer funnet):")
-                    st.write(skipped_list[:50])
+                    st.table(pd.DataFrame(renamed, columns=["gammelt","nytt"]).head(50))
+                if skipped:
+                    st.warning("Hoppet over (ingen del funnet):")
+                    st.write(skipped[:100])
                 if errors:
-                    st.error("Noen feil oppstod ved rename:")
+                    st.error("Feil ved rename:")
                     st.write(errors[:10])
 
 st.markdown("---")
-st.caption("Laget for å automatisere omnavning lokalt. Kjøre lokalt: `streamlit run rename_postnummer_app.py` fra mappen du ønsker eller gi absolutt sti i feltet over.")
+
+# --- Håndter opplasting (drag & drop) ---
+st.subheader("Eller dra & slipp PDF-filer her (opplastede filer pakkes i ZIP med nye navn)")
+uploaded = st.file_uploader("Dra flere filer hit eller klikk for å velge", accept_multiple_files=True, type=["pdf"])
+
+if uploaded:
+    # Bygg preview
+    rows = []
+    for u in uploaded:
+        old = u.name
+        new = compute_new_name(old, sep, split_side, keep_dots, first_n)
+        rows.append({"old_name": old, "proposed": new, "fileobj": u})
+    df_up = pd.DataFrame(rows)
+    df_up["final_new"] = simulate_unique_names(list(df_up["proposed"]))
+    st.write("Forhåndsvisning av opplastede filer:")
+    st.dataframe(df_up.rename(columns={"old_name":"Gammelt navn","final_new":"Nytt navn (preview)"}), height=300)
+    st.info(f"Opplastede filer: {len(df_up)} — Hoppet over (ingen del funnet): {df_up['final_new'].isna().sum()}")
+
+    # Lag ZIP med de omdøpte filene (eller gi mulighet til å laste ned bare preview)
+    make_zip = st.button("Lag ZIP med omdøpte filer (last ned)")
+    if make_zip:
+        # Lag ZIP i minnet
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for _, r in df_up.iterrows():
+                old = r["old_name"]
+                final_new = r["final_new"]
+                fileobj = r["fileobj"]
+                if final_new is None:
+                    # hopp over filer uten foreslått navn
+                    continue
+                # Les bytes og skriv til zip under final_new navn
+                try:
+                    file_bytes = fileobj.read()
+                    zf.writestr(final_new, file_bytes)
+                except Exception as e:
+                    st.error(f"Feil ved behandling av {old}: {e}")
+        zip_buffer.seek(0)
+        st.download_button(
+            label="Last ned ZIP med omdøpte filer",
+            data=zip_buffer.getvalue(),
+            file_name="renamed_pdfs.zip",
+            mime="application/zip"
+        )
+
+st.markdown("---")
+st.caption("Kjør lokalt: `streamlit run rename_postnummer_app.py`. For lokal rename må app kjøre på maskinen som har filene. Opplastede filer behandles kun i appen og tilbys som ZIP — originalene endres ikke.")
