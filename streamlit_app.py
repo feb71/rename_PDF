@@ -148,37 +148,44 @@ st.subheader("Eller dra & slipp PDF-filer her (opplastede filer pakkes i ZIP med
 uploaded = st.file_uploader("Dra flere filer hit eller klikk for å velge", accept_multiple_files=True, type=["pdf"])
 
 if uploaded:
-    # Bygg preview
+    # Hold filobjektene separat for trygg lagring/lesing
+    uploaded_fileobjs = []   # liste med UploadedFile-objekter i samme rekkefølge som df_up
     rows = []
     for u in uploaded:
         old = u.name
         new = compute_new_name(old, sep, split_side, keep_dots, first_n)
-        rows.append({"old_name": old, "proposed": new, "fileobj": u})
+        rows.append({"old_name": old, "proposed": new})
+        uploaded_fileobjs.append(u)  # lagre objektet separat
+
+    # Lag DataFrame MEN uten å legge inn fileobj direkte
     df_up = pd.DataFrame(rows)
     df_up["final_new"] = simulate_unique_names(list(df_up["proposed"]))
+
+    # Vis kun kolonner som PyArrow kan konvertere (strings)
+    preview_df = df_up[["old_name", "final_new"]].rename(
+        columns={"old_name": "Gammelt navn", "final_new": "Nytt navn (preview)"}
+    )
     st.write("Forhåndsvisning av opplastede filer:")
-    st.dataframe(df_up.rename(columns={"old_name":"Gammelt navn","final_new":"Nytt navn (preview)"}), height=300)
+    st.dataframe(preview_df, height=300)
     st.info(f"Opplastede filer: {len(df_up)} — Hoppet over (ingen del funnet): {df_up['final_new'].isna().sum()}")
 
     # Lag ZIP med de omdøpte filene (eller gi mulighet til å laste ned bare preview)
     make_zip = st.button("Lag ZIP med omdøpte filer (last ned)")
     if make_zip:
-        # Lag ZIP i minnet
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for _, r in df_up.iterrows():
-                old = r["old_name"]
+            # iterer ved indeks og bruk uploaded_fileobjs for å få filinnhold
+            for idx, r in df_up.iterrows():
                 final_new = r["final_new"]
-                fileobj = r["fileobj"]
                 if final_new is None:
                     # hopp over filer uten foreslått navn
                     continue
-                # Les bytes og skriv til zip under final_new navn
                 try:
+                    fileobj = uploaded_fileobjs[idx]
                     file_bytes = fileobj.read()
                     zf.writestr(final_new, file_bytes)
                 except Exception as e:
-                    st.error(f"Feil ved behandling av {old}: {e}")
+                    st.error(f"Feil ved behandling av {r['old_name']}: {e}")
         zip_buffer.seek(0)
         st.download_button(
             label="Last ned ZIP med omdøpte filer",
@@ -186,6 +193,8 @@ if uploaded:
             file_name="renamed_pdfs.zip",
             mime="application/zip"
         )
+
+ 
 
 st.markdown("---")
 st.caption("Kjør lokalt: `streamlit run rename_postnummer_app.py`. For lokal rename må app kjøre på maskinen som har filene. Opplastede filer behandles kun i appen og tilbys som ZIP — originalene endres ikke.")
